@@ -80,6 +80,58 @@ def make_metadata(doc):
     metadata['parameters'][name] = make_param(opt)
   return metadata
 
+def make_py_module(module_name, module_path):
+  sigil = "&@SIGIL@&"
+  ball = modify_module(module_name, module_path, sigil)[0]
+  # Replace the sigil
+  find = '\'{"ANSIBLE_MODULE_ARGS": "' + sigil + '"}\''
+  replace = 'json.dumps({"ANSIBLE_MODULE_ARGS": json.load(sys.stdin)})'
+
+  # Some modules are just metadata stubs. Don't make the tast if there aren't
+  # ANSIBALLZ_PARAMS to set.
+  if ball.find(find) == -1:
+    sys.stderr.write("failed to build module %s couldn't find ANSIBALLZ_PARAMS.\n" % module_path)
+    return
+  else:
+    ball = ball.replace(find, replace)
+  return ball
+
+def make_ps1_module(module_name, module_path):
+  "Create a ps1 script whith any helpers inlined."
+  ball = modify_module(module_name, module_path, sigil)[0]
+  mock = type('', (), {})()
+  mock.async = None
+  mock.become = None
+  win_ball = build_windows_module_payload('win_acl', module_path, ball, '', {}, mock, mock, {})
+  script = "# This file should contail all necessary functions\n"
+  for name, mod in win_ball['powershell_modules'].iteritems():
+    script += '# BEGIN%s\n' % name
+    script += base64.decodestring(mod)
+    script += '# END%s\n\n' % name
+  script += " # BEGIN module content\n"
+  script += base64.decodestring(win_ball['module_entry'])
+
+def make_ansible_module(module_name, doc):
+  "Some modules are abstractions over real modules implemented in the ansible CLI"
+
+  script = '''#!/usr/bin/env bash
+if ! which ansible &> /dev/null; then
+  echo '{"_error": {"msg": "Ansible must be installed and on PATH to run ansible modules", "kind": "ansible/not-installed", "details": {}}}'
+  exit 1
+fi
+params=''
+'''
+
+  for opt in doc['options']:
+    param_str = '''if [ ! -z "${PT_%s+x}" ];
+then params="${params} %s=\\"${PT_%s}\\""
+fi
+'''
+    script += param_str % (opt, opt, opt)
+
+  script += 'ansible localhost -m %s --args "${params}" --one-line | cut -f2- -d">"' % module_name
+  return script
+
 
 def make_task(module_path, task_dir):
   "This makes a task that will read arguments from stdin from an ansible module"
@@ -92,31 +144,25 @@ def make_task(module_path, task_dir):
     sys.stderr.write("failed to build module %s couldn't find it's name\n" % module_path)
     return
 
-  taskfile = os.path.join(task_dir, '%s.py' % module_name)
   metadatafile = os.path.join(task_dir, '%s.json' % module_name)
 
   metadata = make_metadata(doc)
-
-  sigil = "&@SIGIL@&"
-  ball = modify_module(module_name, module_path, sigil)[0]
-  # Replace the sigil
-  find = '\'{"ANSIBLE_MODULE_ARGS": "' + sigil + '"}\''
-  replace = 'json.dumps({"ANSIBLE_MODULE_ARGS": json.load(sys.stdin)})'
-
-  # Some modules are just metadata stubs. Don't make the tast if there aren't
-  # ANSIBALLZ_PARAMS to set.
-  if ball.find(find) == -1:
-    sys.stderr.write("failed to build module %s couldn't find ANSIBALLZ_PARAMS.\n" % module_name)
-    return
+  ps1_path = os.path.join(os.path.basename(module_path), 'module_name' + '.ps1')
+  print ps1_path
+  if os.path.exists(ps1_path):
+    taskfile = os.path.join(task_dir, '%s.ps1' % module_name)
+    task = make_ps1_module(ps1_path)
   else:
-    ball = ball.replace(find, replace)
-
-  find = 'import base64'
-  replace = 'import base64\nimport json'
-  ball = ball.replace(find, replace)
+    task = make_py_module(module_name, module_path)
+    if task:
+      taskfile = os.path.join(task_dir, '%s.py' % module_name)
+    else:
+      task = make_ansible_module(module_name, doc)
+      taskfile = os.path.join(task_dir, module_name + '.sh')
+      metadata['description'] += " This task requires ansible to be installed on the target."
 
   with open(taskfile, 'w') as fh:
-    fh.write(ball)
+    fh.write(task)
   os.chmod(taskfile, 0755)
   with open(metadatafile, 'w') as fh:
     json.dump(metadata, fh, indent=2)
